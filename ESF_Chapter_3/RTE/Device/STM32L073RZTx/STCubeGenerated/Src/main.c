@@ -24,8 +24,6 @@
 #include "stm32l073xx.h"
 #include "switch.h"
 #include "delay.h"
-#include "field_access.h"
-#include "gpio.h"
 #include "rgb.h"
 
 /* USER CODE END Includes */
@@ -43,8 +41,8 @@
 */
 #define W_DELAY_SLOW		150
 #define W_DELAY_FAST		70
-#define RGB_DELAY_SLOW		400
-#define RGB_DELAY_FAST		100
+#define RGB_DELAY_SLOW		1000
+#define RGB_DELAY_FAST		150
 
 
 /* USER CODE END PD */
@@ -57,7 +55,10 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+volatile uint8_t g_flash_LED = 0;
+volatile uint8_t g_flash_LED_changed = 1;
+volatile uint32_t g_w_delay = W_DELAY_SLOW;
+volatile uint32_t g_RGB_delay = RGB_DELAY_SLOW;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,6 +68,15 @@ void SystemClock_Config(void);
 //void RGB_Flasher_Sequential(void);
 //void RGB_Flasher_Parallel(void);
 void Flasher(void);
+void Task_Read_Switches(void);
+//void Task_Flash(void);
+//void Task_RGB(void);
+void Task_Flash_FSM_Timer(void);
+void Task_RGB_FSM_Timer(void);
+void EXTI4_15_IRQHandler(void);
+unsigned int TIM_Expired(void);
+void Stop_TIM(void);
+void Start_TIM(uint32_t delay);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -162,82 +172,193 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void Flasher(void) {
-	uint32_t w_delay = W_DELAY_SLOW;
-	uint32_t RGB_delay = RGB_DELAY_SLOW;
-
-	Init_GPIO_RGB();
-	Init_GPIO_Switches();
-	while (1) {
-		if (SWITCH_PRESSED(SW1_POS)) {	// flash white
-			Control_RGB_LEDs(1, 1, 1);
-			Delay(w_delay);
-			Control_RGB_LEDs(0, 0, 0);
-			Delay(w_delay);
-		} else {										// sequence R, G, B
-			Control_RGB_LEDs(1, 0, 0);
-			Delay(RGB_delay);
-			Control_RGB_LEDs(0, 1, 0);
-			Delay(RGB_delay);
-			Control_RGB_LEDs(0, 0, 1);
-			Delay(RGB_delay);
-		}
-		if (SWITCH_PRESSED(SW2_POS)) {
-			w_delay = W_DELAY_FAST;
-			RGB_delay = RGB_DELAY_FAST;
+void EXTI4_15_IRQHandler(void) {
+	if (EXTI->PR & MASK(SW1_POS)) {
+		// Acknowledge interrupt by writing 1 to bit, clearing it (!) 
+		EXTI->PR = MASK(SW1_POS);
+		// Process interrupt
+		if (SWITCH_PRESSED(SW1_POS)) {
+			g_flash_LED = 1;					// Flash white
 		} else {
-			w_delay = W_DELAY_SLOW;
-			RGB_delay = RGB_DELAY_SLOW;
+			g_flash_LED = 0;					// RGB sequence
 		}
+	}
+	if (EXTI->PR & MASK(SW2_POS)) {
+		// Acknowledge interrupt by writing 1 to bit, clearing it (!) 
+		EXTI->PR = MASK(SW2_POS);
+		// Process interrupt
+		if (SWITCH_PRESSED(SW2_POS)) {	// Short delays
+			g_w_delay = W_DELAY_FAST;
+			g_RGB_delay = RGB_DELAY_FAST;
+		} else {										// Long delays
+			g_w_delay = W_DELAY_SLOW;
+			g_RGB_delay = RGB_DELAY_SLOW;
+		}
+	}
+	// NVIC Acknowledge interrupt
+	NVIC_ClearPendingIRQ(EXTI4_15_IRQn);
+}
+
+void Task_RGB_FSM_Timer(void) {
+	enum State { ST_RED, ST_RED_WAIT, ST_GREEN, ST_GREEN_WAIT,
+			ST_BLUE, ST_BLUE_WAIT
+	};
+	static enum State next_state;
+	
+	if (g_flash_LED == 0) {
+		if (g_flash_LED_changed) {
+			next_state = ST_RED;
+			g_flash_LED_changed = 0;
+		}
+		switch (next_state) {
+			case ST_RED:
+				Control_RGB_LEDs(1, 0, 0);
+				Start_TIM(g_RGB_delay);
+				next_state = ST_RED_WAIT;
+				break;
+			case ST_RED_WAIT:
+				if (TIM_Expired()) {
+					Stop_TIM();
+					next_state = ST_GREEN;
+				}
+				break;
+			case ST_GREEN:
+				Control_RGB_LEDs(0, 1, 0);
+				Start_TIM(g_RGB_delay);
+				next_state = ST_GREEN_WAIT;
+				break;
+			case ST_GREEN_WAIT:
+				if (TIM_Expired()) {
+					Stop_TIM();
+					next_state = ST_BLUE;
+				}
+				break;
+			case ST_BLUE:
+				Control_RGB_LEDs(0, 0, 1);
+				Start_TIM(g_RGB_delay);
+				next_state = ST_BLUE_WAIT;
+				break;
+			case ST_BLUE_WAIT:
+				if (TIM_Expired()) {
+					Stop_TIM();
+					next_state = ST_RED;
+				}
+				break;
+			default:
+				next_state = ST_RED;
+				break;
+		}
+	}
+}
+
+void Task_Flash_FSM_Timer(void) {
+	enum State { ST_WHITE, ST_WHITE_WAIT, ST_BLACK, ST_BLACK_WAIT };
+	static enum State next_state = ST_WHITE;
+	
+	if (g_flash_LED == 1) {
+		switch (next_state) {
+			case ST_WHITE:
+				Control_RGB_LEDs(1, 1, 1);
+				Start_TIM(g_w_delay);
+				next_state = ST_WHITE_WAIT;
+				break;
+			case ST_WHITE_WAIT:
+				if (TIM_Expired()) {
+					Stop_TIM();
+					next_state = ST_BLACK;
+				}
+				break;
+			case ST_BLACK:
+				Control_RGB_LEDs(0, 0, 0);
+				Start_TIM(g_w_delay);
+				next_state = ST_BLACK_WAIT;
+				break;
+			case ST_BLACK_WAIT:
+				if (TIM_Expired()) {
+					Stop_TIM();
+					next_state = ST_WHITE;
+				}
+				break;
+			default:
+				next_state = ST_WHITE;
+				break;
+		}
+	} else {
+		next_state = ST_WHITE;
+	}
+}
+
+unsigned int TIM_Expired(void) {
+	return TIM3->SR & TIM_SR_UIF;
+}
+
+void Stop_TIM(void) {
+	TIM3->SR &= ~TIM_SR_UIF; // must clear manually!
+	TIM3->CR1 &= ~TIM_CR1_CEN;
+}
+
+#define TIM_PRESCALER (4800)
+
+void Start_TIM(uint32_t delay) {
+	RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+	// Stop timer in case it was already running
+	Stop_TIM();
+	// Initialize timer
+	TIM3->SMCR = 0;
+	TIM3->CR1 |= TIM_CR1_DIR | TIM_CR1_OPM | TIM_CR1_ARPE; // count down, one-pulse mode, enable preload
+	TIM3->CR2 = 0;
+	TIM3->EGR = 0;
+	TIM3->ARR = delay;
+	TIM3->PSC = TIM_PRESCALER - 1;
+	TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+void Flasher(void) {
+	Init_GPIO_RGB();
+	Init_GPIO_Switches_Interrupts();
+	while (1) {
+		Task_Flash_FSM_Timer();
+		Task_RGB_FSM_Timer();
 	}
 }
 
 /*
-void RGB_Flasher_Init(void) {
-	// Enable peripheral clock of GPIOA (for LD2)	RCC->IOPENR
-	RCC->IOPENR |= RCC_IOPENR_GPIOAEN;
-	// Configure pins in output mode (01=1) 
-	MODIFY_FIELD(GPIOA->MODER, GPIO_MODER_MODE5, ESF_GPIO_MODER_OUTPUT);
-	MODIFY_FIELD(GPIOA->MODER, GPIO_MODER_MODE6, ESF_GPIO_MODER_OUTPUT);
-	MODIFY_FIELD(GPIOA->MODER, GPIO_MODER_MODE7, ESF_GPIO_MODER_OUTPUT);
-	
-	// Turn on LED's
-	GPIOA->BSRR = LED_B_ON_MSK | LED_G_ON_MSK | LED_R_ON_MSK;
-
-}
-
-void RGB_Flasher_Sequential(void) {
-	unsigned int num = 0;
-
-	while (1) {
-		num++;
-		if (num & 1)
-			GPIOA->BSRR = LED_R_ON_MSK;
-		else
-			GPIOA->BSRR = LED_R_OFF_MSK;
-		if (num & 2)
-			GPIOA->BSRR = LED_G_ON_MSK;
-		else
-			GPIOA->BSRR = LED_G_OFF_MSK;
-		if (num & 4)
-			GPIOA->BSRR = LED_B_ON_MSK;
-		else
-			GPIOA->BSRR = LED_B_OFF_MSK;
-		Delay(400);
+void Task_Read_Switches(void) {
+	if (SWITCH_PRESSED(SW1_POS)) {
+		g_flash_LED = 1;		// Flash white
+	} else {
+		g_flash_LED = 0;		// RGB Sequence
 	}
-}
-
-void RGB_Flasher_Parallel(void) {
-	unsigned int num = 0;
-
-	while (1) {
-		num++;
-		GPIOA->ODR &= ~((0x07) << 5);	// Clear all bits in field
-		GPIOA->ODR |= (num & 0x07) << 5;	// Set given bits in field
-		Delay(400);
+	if (SWITCH_PRESSED(SW2_POS)) {
+		g_w_delay = W_DELAY_FAST;
+		g_RGB_delay = RGB_DELAY_FAST;
+	} else {
+		g_w_delay = W_DELAY_SLOW;
+		g_RGB_delay = RGB_DELAY_SLOW;
 	}
 }
 */
+
+void Task_Flash(void) {
+	if (g_flash_LED == 1) {
+		Control_RGB_LEDs(1, 1, 1);
+		Delay(g_w_delay);
+		Control_RGB_LEDs(0, 0, 0);
+		Delay(g_w_delay);
+	}		
+}
+
+void Task_RGB(void) {
+	if (g_flash_LED == 0) {
+		Control_RGB_LEDs(1, 0, 0);
+		Delay(g_RGB_delay);
+		Control_RGB_LEDs(0, 1, 0);
+		Delay(g_RGB_delay);
+		Control_RGB_LEDs(0, 0, 1);
+		Delay(g_RGB_delay);
+	}
+}
+
 /* USER CODE END 4 */
 
 /**
